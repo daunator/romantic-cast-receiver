@@ -39,12 +39,27 @@
 
     const NAMESPACE = 'urn:x-cast:ro.romanticcast.sleeptimer';
     const DEFAULT_MINUTES = 60;
-    const isCastLite = /castlite/i.test(navigator.userAgent);
+
+    // Audio-only CastLite devices (GC4A 2.0, e.g. Nest Mini) can't decode video. Detect that by
+    // capability, keeping the user-agent check as a fallback. Every video-capable Cast device
+    // supports baseline H.264 in MP4 through MSE.
+    function lacksVideoMse() {
+      try {
+        return typeof MediaSource !== 'undefined' &&
+          typeof MediaSource.isTypeSupported === 'function' &&
+          !MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
+      } catch (_) {
+        return false;
+      }
+    }
+    const isCastLite = /castlite/i.test(navigator.userAgent) || lacksVideoMse();
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
     const badge = document.getElementById('sleep-badge');
 
+    /** Set by debug builds of the app (LOAD customData.debug) to get verbose error reports. */
+    let debugEnabled = false;
     let configured = false;
     let timerEnabled = true;
     let durationMs = DEFAULT_MINUTES * 60 * 1000;
@@ -122,6 +137,7 @@
       cast.framework.messages.MessageType.LOAD,
       (loadRequestData) => {
         const custom = (loadRequestData && loadRequestData.customData) || {};
+        debugEnabled = custom.debug === true;
         const keepExisting = custom.keepExistingTimer === true && deadlineMs !== null;
 
         if (!keepExisting && typeof custom.sleepTimerMinutes === 'number') {
@@ -219,10 +235,8 @@
     }
 
     function sendError(source, details) {
-      const payload = Object.assign(
-        { type: 'ERROR', source: source, ua: navigator.userAgent },
-        details
-      );
+      const payload = Object.assign({ type: 'ERROR', source: source }, details);
+      if (debugEnabled) payload.ua = navigator.userAgent;
       try {
         context.sendCustomMessage(NAMESPACE, undefined, payload);
       } catch (_) {
@@ -237,17 +251,17 @@
         sendError('player', {
           detailedErrorCode: event.detailedErrorCode != null ? event.detailedErrorCode : null,
           reason: event.reason != null ? event.reason : null,
-          error: (formatError(event.error) || 'none') + ' | mse: ' + mseCaps()
+          error: (formatError(event.error) || 'none') + (debugEnabled ? ' | mse: ' + mseCaps() : '')
         });
       }
     );
 
     window.addEventListener('error', (event) => {
-      sendError('window', { error: event.message || formatError(event.error) });
+      if (debugEnabled) sendError('window', { error: event.message || formatError(event.error) });
     });
 
     window.addEventListener('unhandledrejection', (event) => {
-      sendError('promise', { error: formatError(event.reason) });
+      if (debugEnabled) sendError('promise', { error: formatError(event.reason) });
     });
 
     const options = new cast.framework.CastReceiverOptions();
