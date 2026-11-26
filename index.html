@@ -1,0 +1,284 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Romantic Cast Receiver</title>
+  <style>
+    body {
+      margin: 0;
+      background: #000;
+      overflow: hidden;
+      font-family: Roboto, sans-serif;
+    }
+    cast-media-player {
+      --theme-hue: 350;
+    }
+    #sleep-badge {
+      position: fixed;
+      top: 32px;
+      right: 40px;
+      padding: 8px 16px;
+      border-radius: 999px;
+      background: rgba(20, 20, 20, 0.78);
+      color: rgba(255, 255, 255, 0.9);
+      font-size: 18px;
+      letter-spacing: 0.2px;
+      display: none;
+      z-index: 10;
+    }
+  </style>
+</head>
+<body>
+  <cast-media-player></cast-media-player>
+  <div id="sleep-badge"></div>
+
+  <script src="https://www.gstatic.com/cast/sdk/libs/caf_receiver/v3/cast_receiver_framework.js"></script>
+  <script>
+    'use strict';
+
+    const NAMESPACE = 'urn:x-cast:ro.romanticcast.sleeptimer';
+    const DEFAULT_MINUTES = 60;
+    const isCastLite = /castlite/i.test(navigator.userAgent);
+
+    const context = cast.framework.CastReceiverContext.getInstance();
+    const playerManager = context.getPlayerManager();
+    const badge = document.getElementById('sleep-badge');
+
+    let configured = false;
+    let timerEnabled = true;
+    let durationMs = DEFAULT_MINUTES * 60 * 1000;
+    let deadlineMs = null;
+    let stopTimeoutId = null;
+
+    function clearCountdown() {
+      if (stopTimeoutId !== null) {
+        clearTimeout(stopTimeoutId);
+        stopTimeoutId = null;
+      }
+      deadlineMs = null;
+      updateBadge();
+    }
+
+    function startCountdown(ms) {
+      clearCountdown();
+      deadlineMs = Date.now() + ms;
+      stopTimeoutId = setTimeout(onTimerExpired, ms);
+      updateBadge();
+    }
+
+    function isPlaybackActive() {
+      const state = playerManager.getPlayerState();
+      return (
+        state === cast.framework.messages.PlayerState.PLAYING ||
+        state === cast.framework.messages.PlayerState.BUFFERING
+      );
+    }
+
+    function remainingMs() {
+      if (!timerEnabled || deadlineMs === null) return null;
+      return Math.max(0, deadlineMs - Date.now());
+    }
+
+    function broadcastStatus(expired) {
+      const payload = {
+        type: 'STATUS',
+        configured: configured,
+        enabled: timerEnabled,
+        remainingMs: expired ? 0 : remainingMs(),
+        expired: Boolean(expired)
+      };
+      try {
+        context.sendCustomMessage(NAMESPACE, undefined, payload);
+      } catch (_) {
+        // No active senders connected (e.g. phone is asleep or disconnected).
+      }
+    }
+
+    function onTimerExpired() {
+      stopTimeoutId = null;
+      deadlineMs = null;
+      updateBadge();
+      broadcastStatus(true);
+      playerManager.stop();
+      // Give status messages a moment to flush, then close the receiver session cleanly.
+      setTimeout(() => context.stop(), 300);
+    }
+
+    function updateBadge() {
+      const left = remainingMs();
+      if (left === null || left <= 0) {
+        badge.style.display = 'none';
+        return;
+      }
+      const mins = Math.ceil(left / 60000);
+      badge.textContent = 'Sleep timer: ' + mins + ' min';
+      badge.style.display = 'block';
+    }
+
+    setInterval(updateBadge, 15000);
+
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.LOAD,
+      (loadRequestData) => {
+        const custom = (loadRequestData && loadRequestData.customData) || {};
+        const keepExisting = custom.keepExistingTimer === true && deadlineMs !== null;
+
+        if (!keepExisting && typeof custom.sleepTimerMinutes === 'number') {
+          configured = true;
+          if (custom.sleepTimerMinutes > 0) {
+            timerEnabled = true;
+            durationMs = custom.sleepTimerMinutes * 60 * 1000;
+            // Arm a fresh countdown to start as soon as PLAYING fires.
+            clearCountdown();
+          } else {
+            timerEnabled = false;
+            clearCountdown();
+          }
+        }
+
+        if (isCastLite && loadRequestData && loadRequestData.media) {
+          // CastLite (GC4A 2.0, e.g. Nest Mini) has no video SourceBuffer; signal audio-only TS.
+          loadRequestData.media.hlsSegmentFormat = cast.framework.messages.HlsSegmentFormat.TS_AAC;
+          delete loadRequestData.media.hlsVideoSegmentFormat;
+        }
+
+        broadcastStatus(false);
+        return loadRequestData;
+      }
+    );
+
+    playerManager.setMessageInterceptor(
+      cast.framework.messages.MessageType.STOP,
+      (stopRequestData) => {
+        clearCountdown();
+        broadcastStatus(false);
+        return stopRequestData;
+      }
+    );
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.PLAYING,
+      () => {
+        if (timerEnabled && deadlineMs === null) {
+          startCountdown(durationMs);
+          broadcastStatus(false);
+        }
+      }
+    );
+
+    context.addCustomMessageListener(NAMESPACE, (event) => {
+      const data = event.data || {};
+      if (data.type === 'SET_TIMER' && typeof data.minutes === 'number') {
+        configured = true;
+        if (data.minutes > 0) {
+          timerEnabled = true;
+          durationMs = data.minutes * 60 * 1000;
+          if (isPlaybackActive()) {
+            startCountdown(durationMs);
+          } else {
+            clearCountdown();
+          }
+        } else {
+          timerEnabled = false;
+          clearCountdown();
+        }
+        broadcastStatus(false);
+      } else if (data.type === 'GET_STATUS') {
+        broadcastStatus(false);
+      }
+    });
+
+    function formatError(err) {
+      if (err == null) return null;
+      if (typeof err === 'string') return err;
+      if (typeof err !== 'object') return String(err);
+      try {
+        const out = {};
+        Object.getOwnPropertyNames(err).forEach((k) => {
+          out[k] = err[k];
+        });
+        for (const k in err) {
+          if (!(k in out)) out[k] = err[k];
+        }
+        return JSON.stringify(out);
+      } catch (_) {
+        return String(err);
+      }
+    }
+
+    function mseCaps() {
+      if (typeof MediaSource === 'undefined' || !MediaSource.isTypeSupported) return 'no-mse';
+      const types = [
+        'video/mp2t; codecs="avc1.64001f, mp4a.40.2"',
+        'video/mp2t; codecs="mp4a.40.2"',
+        'audio/mp4; codecs="mp4a.40.2"',
+        'audio/aac'
+      ];
+      return types.map((t) => t + '=' + MediaSource.isTypeSupported(t)).join('; ');
+    }
+
+    function sendError(source, details) {
+      const payload = Object.assign(
+        { type: 'ERROR', source: source, ua: navigator.userAgent },
+        details
+      );
+      try {
+        context.sendCustomMessage(NAMESPACE, undefined, payload);
+      } catch (_) {
+        // No active senders connected.
+      }
+    }
+
+    playerManager.addEventListener(
+      cast.framework.events.EventType.ERROR,
+      (event) => {
+        console.error('RomanticCast receiver playback error:', event.detailedErrorCode, event.error, event);
+        sendError('player', {
+          detailedErrorCode: event.detailedErrorCode != null ? event.detailedErrorCode : null,
+          reason: event.reason != null ? event.reason : null,
+          error: (formatError(event.error) || 'none') + ' | mse: ' + mseCaps()
+        });
+      }
+    );
+
+    window.addEventListener('error', (event) => {
+      sendError('window', { error: event.message || formatError(event.error) });
+    });
+
+    window.addEventListener('unhandledrejection', (event) => {
+      sendError('promise', { error: formatError(event.reason) });
+    });
+
+    const options = new cast.framework.CastReceiverOptions();
+    options.customNamespaces = {
+      [NAMESPACE]: cast.framework.system.MessageType.JSON
+    };
+    // Other speakers keep MPL, which plays muxed H.264+AAC MPEG-TS cleanly. CastLite needs Shaka
+    // so the shakaConfig below (video stripping + transmux) actually takes effect.
+    options.useShakaForHls = isCastLite;
+    if (isCastLite) {
+      // Nest Mini / GC4A 2.0 (CastLite) rejects video SourceBuffers (DetailedErrorCode 110).
+      // Use Shaka Player to strip the H.264 video track and transmux MPEG-TS to audio-only fMP4.
+      const playbackConfig = new cast.framework.PlaybackConfig();
+      playbackConfig.shakaConfig = {
+        manifest: {
+          disableVideo: true,
+          hls: {
+            mediaPlaylistFullMimeType: 'video/mp2t; codecs="mp4a.40.2"'
+          }
+        },
+        mediaSource: {
+          forceTransmux: true
+        },
+        streaming: {
+          bufferingGoal: 10,
+          bufferBehind: 10
+        }
+      };
+      options.playbackConfig = playbackConfig;
+    }
+    context.start(options);
+  </script>
+</body>
+</html>
