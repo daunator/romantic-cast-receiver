@@ -40,19 +40,10 @@
     const NAMESPACE = 'urn:x-cast:ro.romanticcast.sleeptimer';
     const DEFAULT_MINUTES = 60;
 
-    // Audio-only CastLite devices (GC4A 2.0, e.g. Nest Mini) can't decode video. Detect that by
-    // capability, keeping the user-agent check as a fallback. Every video-capable Cast device
-    // supports baseline H.264 in MP4 through MSE.
-    function lacksVideoMse() {
-      try {
-        return typeof MediaSource !== 'undefined' &&
-          typeof MediaSource.isTypeSupported === 'function' &&
-          !MediaSource.isTypeSupported('video/mp4; codecs="avc1.42E01E"');
-      } catch (_) {
-        return false;
-      }
-    }
-    const isCastLite = /castlite/i.test(navigator.userAgent) || lacksVideoMse();
+    // CastLite firmware (GC4A 2.0, e.g. Nest Mini) rejects video SourceBuffers, while full Cast
+    // firmware on other audio-only speakers plays the muxed H.264+AAC stream through MPL. Both lack
+    // a screen, so a video-capability probe can't tell them apart: match the CastLite user agent.
+    const isCastLite = /castlite/i.test(navigator.userAgent);
 
     const context = cast.framework.CastReceiverContext.getInstance();
     const playerManager = context.getPlayerManager();
